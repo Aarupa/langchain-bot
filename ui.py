@@ -8,6 +8,10 @@ import os
 from voicebot_logic import VoicebotRAG
 import speech_recognition as sr
 from pathlib import Path
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+import av
+from queue import Queue
+import numpy as np
 
 
 # Page configuration
@@ -53,11 +57,25 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# Custom Audio Processor to capture audio frames
+class AudioRecorder(AudioProcessorBase):
+    """Custom audio processor to record audio frames"""
+    def __init__(self):
+        self.audio_frames = []
+    
+    def recv(self, frame):
+        """Receive audio frame and store it"""
+        audio = frame.to_ndarray()
+        self.audio_frames.append(audio)
+        return frame
+
+
 # Initialize session state
 if "voicebot" not in st.session_state:
     st.session_state.voicebot = None
     st.session_state.chat_history = []
     st.session_state.initialized = False
+    st.session_state.audio_recorder = None
 
 
 def initialize_voicebot():
@@ -252,50 +270,98 @@ def main():
         with tab2:
             st.subheader("🎤 Voice-Based Chat")
             
-            st.info("""
-            **How to use:**
-            1. **Record Audio**: Use your device's audio recorder to create an audio file
-            2. **Upload Audio**: Upload the audio file (WAV, MP3, etc.)
-            3. **Get Response**: AI will transcribe and respond in voice format
-            """)
-            
-            st.subheader("📁 Upload & Process Audio")
-            audio_file = st.file_uploader(
-                "Upload audio file (WAV, MP3, M4A, FLAC, OGG)",
-                type=["wav", "mp3", "m4a", "flac", "ogg"],
-                key="voice_upload"
+            # Choose input method
+            input_method = st.radio(
+                "Select input method:",
+                ["🎙️ Direct Recording", "📁 Upload Audio File"],
+                horizontal=True
             )
             
-            if audio_file:
-                # Display the audio player
-                st.audio(audio_file)
+            audio_data = None
+            
+            if input_method == "🎙️ Direct Recording":
+                st.info("""
+                **How to use Direct Recording:**
+                1. Click "Start Recording" to begin recording
+                2. Speak your question/command  
+                3. Click "Stop Recording" to end
+                4. Click "Transcribe & Respond" to process
+                """)
                 
+                # Create audio recorder for this session
+                if st.session_state.audio_recorder is None:
+                    st.session_state.audio_recorder = AudioRecorder()
+                
+                # WebRTC Streamer with custom audio processor
+                webrtc_ctx = webrtc_streamer(
+                    key="speech-to-text",
+                    mode=WebRtcMode.SENDRECV,
+                    media_stream_constraints={"audio": True, "video": False},
+                    audio_frame_callback=st.session_state.audio_recorder.recv,
+                    async_processing=False,
+                )
+                
+                if webrtc_ctx.state.playing:
+                    st.info("🔴 Recording... Speak now!")
+                
+                if not webrtc_ctx.state.playing and len(st.session_state.audio_recorder.audio_frames) > 0:
+                    st.success("✅ Recording complete! Click the button below to process.")
+                
+                # Process recorded audio
+                if st.button("🎯 Transcribe & Respond (Recording)", key="process_recording", use_container_width=True):
+                    if not st.session_state.initialized:
+                        st.error("❌ Voicebot not initialized. Initialize first in the sidebar!")
+                    elif webrtc_ctx.state.playing:
+                        st.warning("⚠️ Please complete the recording first!")
+                    elif len(st.session_state.audio_recorder.audio_frames) == 0:
+                        st.warning("⚠️ No audio data captured. Please start and complete a recording!")
+                    else:
+                        try:
+                            with st.spinner("🔄 Processing audio..."):
+                                # Combine all audio frames
+                                audio_frames = st.session_state.audio_recorder.audio_frames
+                                
+                                # Concatenate all audio frames
+                                combined_audio = np.concatenate(audio_frames, axis=0)
+                                
+                                # Convert to bytes
+                                audio_bytes = (combined_audio * 32767).astype(np.int16).tobytes()
+                                
+                                result = st.session_state.voicebot.process_voice_query(audio_bytes)
+                                
+                                # Add to chat history
+                                st.session_state.chat_history.append({
+                                    "type": "user",
+                                    "content": result['user_input'],
+                                    "mode": "voice"
+                                })
+                                st.session_state.chat_history.append({
+                                    "type": "bot",
+                                    "content": result['answer'],
+                                    "mode": "voice"
+                                })
+                                
+                                # Clear audio frames for next recording
+                                st.session_state.audio_recorder.audio_frames = []
+                                
+                                # Display results
+                                st.success("✅ Processing complete!")
+                                st.write("---")
+                                st.write(f"**🗣️ Your question:** {result['user_input']}")
+                                st.write(f"**🤖 Bot response:** {result['answer']}")
+                                st.write("---")
+                        except Exception as e:
+                            st.error(f"❌ Error processing audio: {e}")
+                            print(f"Debug - Error: {e}")
+                
+                # Convert response to audio for recording
                 col1, col2 = st.columns(2)
-                
                 with col1:
-                    if st.button("🎯 Transcribe & Respond", key="process_audio", use_container_width=True):
-                        if not st.session_state.initialized:
-                            st.error("❌ Voicebot not initialized. Initialize first in the sidebar!")
-                        else:
-                            try:
-                                with st.spinner("🔄 Processing audio..."):
-                                    audio_data = audio_file.read()
-                                    result = st.session_state.voicebot.process_voice_query(audio_data)
-                                    
-                                    # Display results
-                                    st.success("✅ Processing complete!")
-                                    st.write("---")
-                                    st.write(f"**🗣️ Your question:** {result['user_input']}")
-                                    st.write(f"**🤖 Bot response:** {result['answer']}")
-                                    st.write("---")
-                                    
-                            except Exception as e:
-                                st.error(f"❌ Error processing audio: {e}")
-                
+                    st.empty()  # Placeholder for alignment
                 with col2:
-                    if st.button("🔊 Convert Response to Audio", key="tts_btn", use_container_width=True):
-                        if not st.session_state.chat_history or not st.session_state.chat_history[-1]['type'] == 'bot':
-                            st.warning("⚠️ No response to convert. Process an audio file first!")
+                    if st.button("🔊 Convert Response to Audio (Recording)", key="tts_recording", use_container_width=True):
+                        if not st.session_state.chat_history or st.session_state.chat_history[-1]['type'] != 'bot':
+                            st.warning("⚠️ No response to convert. Process a recording first!")
                         else:
                             try:
                                 last_response = st.session_state.chat_history[-1]['content']
@@ -309,8 +375,67 @@ def main():
                                         st.error("❌ Failed to generate audio")
                             except Exception as e:
                                 st.error(f"❌ Error generating audio: {e}")
-            else:
-                st.info("👆 Upload an audio file to get started!")
+            
+            else:  # File Upload
+                st.info("""
+                **How to use File Upload:**
+                1. **Select audio file**: Choose from your device
+                2. **Upload**: Wait for upload to complete
+                3. **Get Response**: AI will transcribe and respond
+                """)
+                
+                st.subheader("📁 Upload & Process Audio")
+                audio_file = st.file_uploader(
+                    "Upload audio file (WAV, MP3, M4A, FLAC, OGG)",
+                    type=["wav", "mp3", "m4a", "flac", "ogg"],
+                    key="voice_upload"
+                )
+                
+                if audio_file:
+                    # Display the audio player
+                    st.audio(audio_file)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.button("🎯 Transcribe & Respond (Upload)", key="process_audio", use_container_width=True):
+                            if not st.session_state.initialized:
+                                st.error("❌ Voicebot not initialized. Initialize first in the sidebar!")
+                            else:
+                                try:
+                                    with st.spinner("🔄 Processing audio..."):
+                                        audio_data = audio_file.read()
+                                        result = st.session_state.voicebot.process_voice_query(audio_data)
+                                        
+                                        # Display results
+                                        st.success("✅ Processing complete!")
+                                        st.write("---")
+                                        st.write(f"**🗣️ Your question:** {result['user_input']}")
+                                        st.write(f"**🤖 Bot response:** {result['answer']}")
+                                        st.write("---")
+                                        
+                                except Exception as e:
+                                    st.error(f"❌ Error processing audio: {e}")
+                    
+                    with col2:
+                        if st.button("🔊 Convert Response to Audio", key="tts_btn", use_container_width=True):
+                            if not st.session_state.chat_history or not st.session_state.chat_history[-1]['type'] == 'bot':
+                                st.warning("⚠️ No response to convert. Process an audio file first!")
+                            else:
+                                try:
+                                    last_response = st.session_state.chat_history[-1]['content']
+                                    with st.spinner("🔊 Generating voice response..."):
+                                        audio_path = st.session_state.voicebot.text_to_speech(last_response)
+                                        if audio_path and os.path.exists(audio_path):
+                                            st.success("✅ Voice response ready!")
+                                            with open(audio_path, 'rb') as f:
+                                                st.audio(f.read(), format="audio/mp3")
+                                        else:
+                                            st.error("❌ Failed to generate audio")
+                                except Exception as e:
+                                    st.error(f"❌ Error generating audio: {e}")
+                else:
+                    st.info("👆 Upload an audio file to get started!")
         
         with tab3:
             st.subheader("📊 Conversation History")
